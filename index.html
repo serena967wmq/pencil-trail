@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pencil Trail — demo</title>
+<style>
+  html,body{margin:0;height:100%;background:#fcfbf8;overflow:hidden;cursor:none;}
+  #hint{position:fixed;left:50%;top:12%;transform:translateX(-50%);
+        font-family:Georgia,serif;font-style:italic;color:#c7c2b6;font-size:16px;
+        letter-spacing:.4px;pointer-events:none;z-index:5;transition:opacity .6s;}
+</style>
+</head>
+<body>
+<div id="hint">move your mouse — draw with a pencil on its side</div>
+<script type="module">
+  import { PencilTrail } from './pencil-trail.js';
+  new PencilTrail();
+  // hide the hint after the first move
+  addEventListener('pointermove', () => { const h=document.getElementById('hint'); if(h) h.style.opacity=0; }, { once:true });
+</script>
+</body>
+</html>

@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Side-of-Pencil Graphite Cursor Trail</title>
+<!--
+  ============================================================================
+  SIDE-OF-PENCIL GRAPHITE CURSOR TRAIL
+  ----------------------------------------------------------------------------
+  A mouse-trail that draws like a soft graphite pencil held on its side:
+    • the cursor IS the nib — the sharp/dark edge sits exactly on the cursor
+    • feathers to one side into faint, grainy "tooth" (asymmetric, like 6B / Procreate "Huntsman")
+    • velocity-aware width + a head-dark -> tail-light fade ("摆尾渐变")
+    • one continuous arc-length pass (no per-segment restarts -> no beads / legs / tadpoles)
+    • getCoalescedEvents() keeps fast strokes smooth, Catmull-Rom + streamline round the corners
+
+  HOW TO REUSE
+    • Drop this whole file in as a standalone page, OR
+    • Copy the <canvas id="paper">, the #nib div, and the <script> into any page.
+      It overlays full-window and is pointer-events:none-friendly (it only listens to
+      pointermove on window). Put your real content above it in z-index if needed.
+    • Open it directly in a browser (double-click). It does NOT need a server.
+
+  TUNING — see the CONFIG block at the top of the script. Common tweaks:
+    • darker / lighter ........ CONFIG.darkMin / darkMax
+    • thicker / thinner ....... CONFIG.widthMin / widthMax
+    • longer / shorter tail ... CONFIG.decay (smaller = longer)
+    • which side feathers ..... CONFIG.featherSign (+1 or -1)
+    • grain density ........... CONFIG.grainPerPx
+    • paper / ink colour ...... CSS body background + CONFIG.inkBase
+  ============================================================================
+-->
+<style>
+  html,body{margin:0;height:100%;background:#fcfbf8;overflow:hidden;cursor:none;}
+  #paper{display:block;position:fixed;inset:0;}
+  /* the little dot that marks the cursor / nib; set opacity:0 to hide it entirely */
+  #nib{position:fixed;width:8px;height:8px;border-radius:50%;background:#2b2b2b;opacity:.4;
+        transform:translate(-50%,-50%);pointer-events:none;z-index:10;}
+</style>
+</head>
+<body>
+<canvas id="paper"></canvas>
+<div id="nib"></div>
+
+<script>
+/* ============================ CONFIG (tweak me) ============================ */
+const CONFIG = {
+  decay:       0.018,  // trail life lost per frame; smaller = longer trail (~0.012–0.03)
+  widthMin:    3.5,    // half-width at the tail (px)
+  widthMax:    10.5,   // half-width at the head (widthMin + this delta region)
+  darkMin:     0.16,   // ink strength at the tail
+  darkMax:     0.50,   // ink strength at the head (keep < ~0.6 so the head stays airy, not a blob)
+  grainPerPx:  1.8,    // grains per px of half-width (density of the tooth)
+  featherSign: 1,      // +1 or -1 : which side the grain feathers toward
+  inkBase:     20,     // base grey of graphite specks (0=black); specks vary +0..32
+  streamline:  0.28,   // input smoothing 0..1, lower = rounder/smoother (more lag)
+  step:        3,      // input resample spacing (px)
+  dot:         1.4,    // arc-length spacing between grain columns (px); smaller = denser
+  maxPoints:   1100,   // safety cap on stored points
+};
+/* ========================================================================== */
+
+const vis=document.getElementById('paper');
+const visCtx=vis.getContext('2d');
+const nib=document.getElementById('nib');
+const ink=document.createElement('canvas');     // offscreen layer we redraw each frame
+const inkCtx=ink.getContext('2d');
+
+let W,H,DPR;
+function resize(){
+  DPR=Math.min(window.devicePixelRatio||1,2);
+  W=Math.max(1,innerWidth); H=Math.max(1,innerHeight);
+  for(const c of [vis,ink]){ c.width=W*DPR; c.height=H*DPR; }
+  vis.style.width=W+'px'; vis.style.height=H+'px';
+  visCtx.setTransform(DPR,0,0,DPR,0,0);
+  inkCtx.setTransform(DPR,0,0,DPR,0,0);
+}
+resize();
+let _rt; addEventListener('resize',()=>{clearTimeout(_rt);_rt=setTimeout(resize,150);});
+
+// seeded RNG: each grain column is generated from its (quantized) arc position,
+// so the grain is STABLE across frames (no per-frame jitter / shimmer).
+function mulberry(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+
+/* ----- input capture: streamline + resample into the RAW point buffer ----- */
+const RAW=[];
+let last=null, sm=null;
+function add(x,y){
+  nib.style.left=x+'px'; nib.style.top=y+'px';
+  // streamline: ease the tracked point toward the raw cursor -> rounds sharp polyline corners
+  if(!sm){ sm={x,y}; } else { sm.x+=(x-sm.x)*CONFIG.streamline; sm.y+=(y-sm.y)*CONFIG.streamline; }
+  const sx=sm.x, sy=sm.y;
+  if(last){
+    const dx=sx-last.x, dy=sy-last.y, d=Math.hypot(dx,dy);
+    const steps=Math.max(1,Math.floor(d/CONFIG.step));
+    for(let i=1;i<=steps;i++){ const t=i/steps; RAW.push({x:last.x+dx*t,y:last.y+dy*t,life:1}); }
+  } else RAW.push({x:sx,y:sy,life:1});
+  last={x:sx,y:sy};
+}
+function handle(e){
+  // getCoalescedEvents() recovers the sub-samples the browser buffered between
+  // frames — this is what keeps FAST strokes smooth instead of polygonal.
+  const evs = (e.getCoalescedEvents && e.getCoalescedEvents().length) ? e.getCoalescedEvents() : [e];
+  for(const ev of evs) add(ev.clientX, ev.clientY);
+}
+addEventListener('pointermove',handle);
+
+/* ----- Catmull-Rom: turn the RAW polyline into a dense smooth centreline ----- */
+function smoothCentre(pts){
+  if(pts.length<3) return pts.map(p=>({x:p.x,y:p.y,life:p.life}));
+  const out=[];
+  for(let i=0;i<pts.length-1;i++){
+    const p0=pts[i-1]||pts[i], p1=pts[i], p2=pts[i+1], p3=pts[i+2]||pts[i+1];
+    const segLen=Math.hypot(p2.x-p1.x,p2.y-p1.y);
+    const sub=Math.max(2,Math.round(segLen/1));
+    for(let s=0;s<sub;s++){
+      const t=s/sub,t2=t*t,t3=t2*t;
+      const x=0.5*((2*p1.x)+(-p0.x+p2.x)*t+(2*p0.x-5*p1.x+4*p2.x-p3.x)*t2+(-p0.x+3*p1.x-3*p2.x+p3.x)*t3);
+      const y=0.5*((2*p1.y)+(-p0.y+p2.y)*t+(2*p0.y-5*p1.y+4*p2.y-p3.y)*t2+(-p0.y+3*p1.y-3*p2.y+p3.y)*t3);
+      out.push({x,y,life:p1.life+(p2.life-p1.life)*t});
+    }
+  }
+  const lp=pts[pts.length-1]; out.push({x:lp.x,y:lp.y,life:lp.life});
+  return out;
+}
+
+/* ----- render: ONE continuous deposit pass along the whole centreline ----- */
+function tick(){
+  for(const s of RAW) s.life-=CONFIG.decay;
+  while(RAW.length && RAW[0].life<=0) RAW.shift();
+  if(RAW.length>CONFIG.maxPoints) RAW.splice(0,RAW.length-CONFIG.maxPoints);
+
+  inkCtx.setTransform(DPR,0,0,DPR,0,0);
+  inkCtx.clearRect(0,0,W,H);
+
+  const C=smoothCentre(RAW);
+  const n=C.length;
+  if(n>2){
+    // cumulative arc length -> "headness" (0 at tail, 1 at the cursor)
+    let acc=0; const cum=[0];
+    for(let i=1;i<n;i++){ acc+=Math.hypot(C[i].x-C[i-1].x,C[i].y-C[i-1].y); cum.push(acc); }
+    const total=acc||1;
+
+    let carried=0;
+    for(let i=1;i<n;i++){
+      const a=C[i-1], b=C[i];
+      const segLen=Math.hypot(b.x-a.x,b.y-a.y)||0.0001;
+      const ux=(b.x-a.x)/segLen, uy=(b.y-a.y)/segLen;
+      const nx=-uy*CONFIG.featherSign, ny=ux*CONFIG.featherSign;   // feather direction (one side)
+      for(let d=carried; d<segLen; d+=CONFIG.dot){
+        const f=d/segLen;
+        const px=a.x+(b.x-a.x)*f, py=a.y+(b.y-a.y)*f;
+        const headness=(cum[i-1]+d)/total;       // 0 tail .. 1 head
+        const life=a.life+(b.life-a.life)*f;
+        const darkBase=(CONFIG.darkMin+(CONFIG.darkMax-CONFIG.darkMin)*Math.pow(headness,0.7))*life;
+        const halfW=(CONFIG.widthMin+CONFIG.widthMax*Math.pow(headness,0.55));
+
+        // a short COLUMN of grains across the section; sharp/dark on the cursor side,
+        // sparse + faint toward the feather side. Seed = quantized arc position (stable).
+        const rng=mulberry(Math.floor((cum[i-1]+d)*7.3)|0);
+        const cols=Math.round(halfW*CONFIG.grainPerPx);
+        for(let k=0;k<cols;k++){
+          const u=Math.pow(rng(),1.5);           // 0 at nib(cursor) .. 1 at airy edge
+          const edge=u;
+          const fade=Math.pow(1-edge,2.0);        // strong falloff -> faint feather, hides stray specks
+          const lat=u*halfW + (rng()-0.5)*0.8;
+          const gx=px+nx*lat, gy=py+ny*lat;
+          const dark=darkBase*fade*(0.55+0.45*rng());
+          const g=CONFIG.inkBase+rng()*32;
+          const sz=(0.8+(1-edge)*1.1)*(0.7+0.6*rng());
+          inkCtx.fillStyle=`rgba(${g|0},${g|0},${g|0},${Math.min(1,dark)})`;
+          inkCtx.fillRect(gx-sz/2,gy-sz/2,sz,sz);
+        }
+      }
+      carried=(carried<segLen)? (CONFIG.dot-((segLen-carried)%CONFIG.dot))%CONFIG.dot : carried-segLen;
+    }
+  }
+
+  visCtx.setTransform(1,0,0,1,0,0);
+  visCtx.clearRect(0,0,vis.width,vis.height);
+  visCtx.drawImage(ink,0,0);
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
